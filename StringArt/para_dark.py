@@ -206,7 +206,7 @@ def generate_string_art(image_array, num_pins, max_lines, min_distance, min_loop
     error_image = 255.0 - image_array # error_image is float32
 
     output_res = img_size * SCALE
-    output_image_pil = Image.new('L', (output_res, output_res), 255) # White background
+    output_image_pil = Image.new('L', (output_res, output_res), 0) # Black background
     draw_output = ImageDraw.Draw(output_image_pil)
 
     line_sequence = []
@@ -270,7 +270,7 @@ def generate_string_art(image_array, num_pins, max_lines, min_distance, min_loop
 
         p1_scaled = (pin_coords[current_pin][0] * SCALE, pin_coords[current_pin][1] * SCALE)
         p2_scaled = (pin_coords[best_pin][0] * SCALE, pin_coords[best_pin][1] * SCALE)
-        draw_output.line([p1_scaled, p2_scaled], fill=0, width=1)
+        draw_output.line([p1_scaled, p2_scaled], fill=255, width=1)
 
         last_pins.append(current_pin)
         current_pin = best_pin
