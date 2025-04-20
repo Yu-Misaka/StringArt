@@ -8,13 +8,6 @@ import os
 import time
 # === Add multiprocessing imports ===
 import multiprocessing
-from functools import partial # Handy for passing fixed arguments to worker
-# Optional: for progress bar
-try:
-    from tqdm import tqdm
-    TQDM_AVAILABLE = True
-except ImportError:
-    TQDM_AVAILABLE = False
 
 # === Constants (remain the same) ===
 IMG_SIZE = 500
@@ -80,73 +73,88 @@ def get_line_pixels(p1, p2, img_size):
     unique_coords = coords[unique_mask]
     return unique_coords[:, 0], unique_coords[:, 1]
 
-# === Parallel Pre-calculation ===
+# --- Parallel Pre-calculation ---
 
-# Define the worker function at the top level (required for pickling by multiprocessing)
-def _worker_calculate_line(pin_indices, pin_coords_list, img_size):
-    """Calculates pixel coordinates for a single line between two pins."""
+# Global variables for worker processes (initialized once per worker)
+worker_pin_coords = None
+worker_img_size = None
+
+def init_worker(pin_coords_data, img_size_data):
+    """Initializer function for each worker process."""
+    global worker_pin_coords, worker_img_size
+    worker_pin_coords = pin_coords_data
+    worker_img_size = img_size_data
+    # print(f"Worker {os.getpid()} initialized.") # Optional debug print
+
+def calculate_line_task(pin_indices):
+    """The function executed by each worker process."""
+    global worker_pin_coords, worker_img_size
     i, j = pin_indices
-    p1 = pin_coords_list[i]
-    p2 = pin_coords_list[j]
-    rows, cols = get_line_pixels(p1, p2, img_size)
-    # Return the original indices along with the result
-    return (i, j, rows, cols)
+    try:
+        p1 = worker_pin_coords[i]
+        p2 = worker_pin_coords[j]
+        rows, cols = get_line_pixels(p1, p2, worker_img_size)
+        # Return the original indices along with the results
+        return i, j, rows, cols
+    except Exception as e:
+        print(f"Error in worker {os.getpid()} processing pins {i},{j}: {e}")
+        return i, j, None, None # Return None on error
 
 def precalculate_lines_parallel(pin_coords, num_pins, img_size, min_distance):
     """Pre-calculates pixel coordinates in parallel using multiprocessing."""
-    print(f"Pre-calculating lines using up to {os.cpu_count()} cores...")
+    print("Pre-calculating lines (parallel)...")
     start_time = time.time()
 
-    # 1. Prepare Tasks: Generate list of (i, j) pairs to calculate
+    # 1. Generate list of tasks (pairs of pin indices)
     tasks = []
     for i in range(num_pins):
-        for j in range(i + 1, num_pins): # Only need one direction (i < j)
+        for j in range(i + 1, num_pins):
             dist = min((j - i) % num_pins, (i - j) % num_pins)
-            if dist >= min_distance:
-                tasks.append((i, j))
+            if dist < min_distance:
+                continue
+            tasks.append((i, j))
 
-    print(f"Generated {len(tasks)} line calculation tasks.")
+    print(f"  Generated {len(tasks)} line calculation tasks.")
     if not tasks:
-        print("Warning: No valid line tasks generated based on min_distance.")
+        print("  No tasks to run.")
         return {}
 
-    # Convert pin_coords to list for pickling if it's not already
-    pin_coords_list = list(pin_coords)
-
-    # Use partial to fix the pin_coords_list and img_size arguments for the worker
-    worker_func = partial(_worker_calculate_line, pin_coords_list=pin_coords_list, img_size=img_size)
-
-    # 2. Create Pool and Map Tasks
     line_cache = {}
-    results = []
+    # Determine number of processes (use all available cores by default)
+    num_workers = os.cpu_count()
+    print(f"  Starting parallel calculation with {num_workers} workers...")
+
     try:
-        # Use context manager for automatic pool cleanup
-        with multiprocessing.Pool(processes=os.cpu_count()) as pool:
-            # Use starmap if worker takes multiple args, map if worker takes one arg (the tuple (i, j))
-            # Here, the worker takes the tuple (i, j) because we used partial
-            if TQDM_AVAILABLE:
-                # Wrap the iterator with tqdm for a progress bar
-                 results = list(tqdm(pool.imap(worker_func, tasks), total=len(tasks), desc="Pre-calculating lines"))
+        # 2. Create a Pool of worker processes
+        # Use initializer to pass read-only data efficiently
+        with multiprocessing.Pool(processes=num_workers,
+                                initializer=init_worker,
+                                initargs=(pin_coords, img_size)) as pool:
+
+            # 3. Map tasks to the pool (starmap unpacks arguments)
+            # pool.map will block until all results are ready
+            results = pool.map(calculate_line_task, tasks)
+
+        # 4. Process results and populate the cache
+        print("  Parallel calculation finished. Processing results...")
+        calculation_count = 0
+        for i, j, rows, cols in results:
+            if rows is not None and cols is not None:
+                line_cache[(i, j)] = (rows, cols)
+                line_cache[(j, i)] = (rows, cols) # Cache reverse direction too
+                calculation_count += 1
             else:
-                 results = pool.map(worker_func, tasks) # pool.map is simpler here due to partial
+                 print(f"  Warning: Failed to calculate line for pins ({i}, {j}).")
+
+
+        end_time = time.time()
+        print(f"Line pre-calculation finished ({calculation_count}/{len(tasks)} lines cached) in {end_time - start_time:.2f} seconds.")
+        return line_cache
 
     except Exception as e:
-        print(f"An error occurred during parallel processing: {e}")
-        # Optional: Fallback to sequential? Or just raise/exit.
-        return {} # Return empty cache on error
-
-    # 3. Reconstruct Cache from results
-    calculation_count = 0
-    for result in results:
-        if result: # Check if worker returned valid data
-            i, j, rows, cols = result
-            line_cache[(i, j)] = (rows, cols)
-            line_cache[(j, i)] = (rows, cols) # Add reverse direction
-            calculation_count += 1
-
-    end_time = time.time()
-    print(f"Line pre-calculation finished ({calculation_count} lines cached) in {end_time - start_time:.2f} seconds.")
-    return line_cache
+        print(f"An error occurred during parallel pre-calculation: {e}")
+        # Fallback or re-raise? For simplicity, return empty cache
+        return {}
 
 
 # === Main Algorithm (generate_string_art remains the same) ===
@@ -224,6 +232,7 @@ if __name__ == "__main__":
     parser.add_argument("--error_power", type=float, default=DEFAULT_ERROR_POWER, help=f"Exponent for error calculation (default: {DEFAULT_ERROR_POWER})")
     parser.add_argument("--brightness", type=float, default=DEFAULT_LINE_BRIGHTNESS, help=f"Brightness added per line to output (default: {DEFAULT_LINE_BRIGHTNESS})")
     parser.add_argument("--previewpins", action='store_true', help="Draw markers for pins on the preview image.")
+    parser.add_argument("--negative", action='store_true', help="Color negation.")
     args = parser.parse_args()
 
     # --- Main Steps ---
@@ -263,7 +272,11 @@ if __name__ == "__main__":
                     (int(scaled_x-pin_marker_radius), int(scaled_y-pin_marker_radius),
                      int(scaled_x+pin_marker_radius), int(scaled_y+pin_marker_radius)),
                     fill=255)
-        preview_image.save(args.output_png)
+        if args.negative:
+          preview_image.save(args.output_png)
+        else:
+          preview_image = preview_image.point(lambda _: 255-_)
+          preview_image.save(args.output_png)
         print(f"String art preview saved to '{args.output_png}'")
     except IOError as e: print(f"Error saving preview image: {e}")
     except Exception as e: print(f"An unexpected error occurred saving preview: {e}")

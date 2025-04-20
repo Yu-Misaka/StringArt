@@ -1,5 +1,5 @@
 import numpy as np
-from PIL import Image, ImageDraw, ImageOps
+from PIL import Image, ImageDraw
 import math
 import argparse
 from collections import deque
@@ -300,6 +300,7 @@ if __name__ == "__main__":
     parser.add_argument("--mindist", type=int, default=MIN_DISTANCE, help=f"Minimum pin distance for connections (default: {MIN_DISTANCE})")
     parser.add_argument("--minloop", type=int, default=MIN_LOOP, help=f"Number of recent pins to avoid reusing (default: {MIN_LOOP})")
     parser.add_argument("--previewpins", action='store_true', help="Draw markers for pins on the preview image.")
+    parser.add_argument("--negative", action='store_true', help="Color negation.")
 
 
     args = parser.parse_args()
@@ -354,8 +355,11 @@ if __name__ == "__main__":
                      int(scaled_x + pin_marker_radius), int(scaled_y + pin_marker_radius)),
                     fill=255 # White pins
                 )
-
-        preview_image.save(args.output_png)
+        if args.negative:
+          preview_image.save(args.output_png)
+        else:
+          preview_image = preview_image.point(lambda _: 255-_)
+          preview_image.save(args.output_png)
         print(f"String art preview saved to '{args.output_png}'")
     except IOError as e:
         print(f"Error saving preview image: {e}")

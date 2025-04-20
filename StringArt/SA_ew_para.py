@@ -3,8 +3,9 @@ from PIL import Image, ImageDraw, ImageOps
 import math
 import argparse
 from collections import deque
-import os
 import time
+import os
+import multiprocessing # Import the multiprocessing library
 # ***** Add Scipy Import *****
 from scipy.ndimage import sobel
 
@@ -115,24 +116,88 @@ def get_line_pixels(p1, p2, img_size):
     return unique_coords[:, 0], unique_coords[:, 1]
 
 
-def precalculate_lines(pin_coords, num_pins, img_size, min_distance):
-    """Pre-calculates pixel coordinates for all valid lines between pins."""
-    print("Pre-calculating lines...")
-    start_time = time.time(); line_cache = {}; calculation_count = 0
+# --- Parallel Pre-calculation ---
+
+# Global variables for worker processes (initialized once per worker)
+worker_pin_coords = None
+worker_img_size = None
+
+def init_worker(pin_coords_data, img_size_data):
+    """Initializer function for each worker process."""
+    global worker_pin_coords, worker_img_size
+    worker_pin_coords = pin_coords_data
+    worker_img_size = img_size_data
+    # print(f"Worker {os.getpid()} initialized.") # Optional debug print
+
+def calculate_line_task(pin_indices):
+    """The function executed by each worker process."""
+    global worker_pin_coords, worker_img_size
+    i, j = pin_indices
+    try:
+        p1 = worker_pin_coords[i]
+        p2 = worker_pin_coords[j]
+        rows, cols = get_line_pixels(p1, p2, worker_img_size)
+        # Return the original indices along with the results
+        return i, j, rows, cols
+    except Exception as e:
+        print(f"Error in worker {os.getpid()} processing pins {i},{j}: {e}")
+        return i, j, None, None # Return None on error
+
+def precalculate_lines_parallel(pin_coords, num_pins, img_size, min_distance):
+    """Pre-calculates pixel coordinates in parallel using multiprocessing."""
+    print("Pre-calculating lines (parallel)...")
+    start_time = time.time()
+
+    # 1. Generate list of tasks (pairs of pin indices)
+    tasks = []
     for i in range(num_pins):
         for j in range(i + 1, num_pins):
             dist = min((j - i) % num_pins, (i - j) % num_pins)
-            if dist < min_distance: continue
-            p1 = pin_coords[i]; p2 = pin_coords[j]
-            rows, cols = get_line_pixels(p1, p2, img_size)
-            if len(rows) > 0: # Only cache lines with pixels
+            if dist < min_distance:
+                continue
+            tasks.append((i, j))
+
+    print(f"  Generated {len(tasks)} line calculation tasks.")
+    if not tasks:
+        print("  No tasks to run.")
+        return {}
+
+    line_cache = {}
+    # Determine number of processes (use all available cores by default)
+    num_workers = os.cpu_count()
+    print(f"  Starting parallel calculation with {num_workers} workers...")
+
+    try:
+        # 2. Create a Pool of worker processes
+        # Use initializer to pass read-only data efficiently
+        with multiprocessing.Pool(processes=num_workers,
+                                initializer=init_worker,
+                                initargs=(pin_coords, img_size)) as pool:
+
+            # 3. Map tasks to the pool (starmap unpacks arguments)
+            # pool.map will block until all results are ready
+            results = pool.map(calculate_line_task, tasks)
+
+        # 4. Process results and populate the cache
+        print("  Parallel calculation finished. Processing results...")
+        calculation_count = 0
+        for i, j, rows, cols in results:
+            if rows is not None and cols is not None:
                 line_cache[(i, j)] = (rows, cols)
-                line_cache[(j, i)] = (rows, cols)
+                line_cache[(j, i)] = (rows, cols) # Cache reverse direction too
                 calculation_count += 1
-        if (i + 1) % 50 == 0 or i == num_pins - 1: print(f"  Pre-calculated lines originating from pin {i+1}/{num_pins}...")
-    end_time = time.time()
-    print(f"Line pre-calculation finished ({calculation_count} lines cached) in {end_time - start_time:.2f} seconds.")
-    return line_cache
+            else:
+                 print(f"  Warning: Failed to calculate line for pins ({i}, {j}).")
+
+
+        end_time = time.time()
+        print(f"Line pre-calculation finished ({calculation_count}/{len(tasks)} lines cached) in {end_time - start_time:.2f} seconds.")
+        return line_cache
+
+    except Exception as e:
+        print(f"An error occurred during parallel pre-calculation: {e}")
+        # Fallback or re-raise? For simplicity, return empty cache
+        return {}
 
 # --- Main Algorithm ---
 
@@ -224,7 +289,7 @@ if __name__ == "__main__":
     # ***** New Argument *****
     parser.add_argument("--ew", "--edge_weight", type=float, default=DEFAULT_EDGE_WEIGHT, dest='edge_weight', help=f"Weight factor for edges in line selection (default: {DEFAULT_EDGE_WEIGHT:.2f})")
     parser.add_argument("--no_contrast", action='store_false', dest='enhance_contrast', help="Disable automatic contrast enhancement during preprocessing.")
-
+    parser.add_argument("--negative", action='store_true', help="Color negation.")
 
     args = parser.parse_args()
 
@@ -253,7 +318,7 @@ if __name__ == "__main__":
     pin_coordinates = calculate_pin_coords(args.pins, args.size)
 
     # 3. Pre-calculate Lines
-    line_pixel_cache = precalculate_lines(pin_coordinates, args.pins, args.size, args.mindist)
+    line_pixel_cache = precalculate_lines_parallel(pin_coordinates, args.pins, args.size, args.mindist)
     if not line_pixel_cache: print("Error: No valid lines pre-calculated."); exit(1)
 
     # 4. Generate String Art Sequence (pass edge map and weight factor)
@@ -284,7 +349,11 @@ if __name__ == "__main__":
             for x, y in pin_coordinates:
                 scaled_x = x * SCALE; scaled_y = y * SCALE
                 draw_preview.ellipse((int(scaled_x-pin_marker_radius), int(scaled_y-pin_marker_radius), int(scaled_x+pin_marker_radius), int(scaled_y+pin_marker_radius)), fill=255) # White pins
-        preview_image.save(args.output_png)
+        if args.negative:
+          preview_image.save(args.output_png)
+        else:
+          preview_image = preview_image.point(lambda _: 255-_)
+          preview_image.save(args.output_png)
         print(f"String art preview saved to '{args.output_png}'")
     except IOError as e: print(f"Error saving preview image: {e}")
     except Exception as e: print(f"An unexpected error occurred: {e}")
