@@ -126,8 +126,8 @@ def dump_arcs(solution, hooks, edge_codes, filename):
 def main():
     filename, output_prefix = sys.argv[1:]
 
-    n = 180
-    radius = 250
+    n = 288
+    radius = 1000
 
     sparse, hooks, edge_codes = build_arc_adjecency_matrix(n, radius)
     # sparse, hooks, edge_codes = build_circle_adjecency_matrix(radius, 10)
