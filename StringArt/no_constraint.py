@@ -2,23 +2,37 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageOps
 import math
 import argparse
-from collections import deque # Not needed for segments, but keep imports clean
+# import deque
 import os
 import time
-from scipy.ndimage import sobel # Keep for edge weighting
+from scipy.ndimage import sobel
+import multiprocessing
+# ***** Import Array and Lock for shared memory *****
+from multiprocessing import Pool, Array, Lock
+from functools import partial
+import ctypes # To work with shared memory Array types
 
 # --- Constants ---
 IMG_SIZE = 500
 DEFAULT_N_PINS = 288
-DEFAULT_MAX_LINES = 1500 # Default might be lower now as convergence is faster
+DEFAULT_MAX_LINES = 1500 # segments
 MIN_DISTANCE = 15
-# MIN_LOOP is irrelevant now
 DEFAULT_LINE_WEIGHT = 25
 SCALE = 2
 DEFAULT_EDGE_WEIGHT = 0.8
+DEFAULT_WORKERS = os.cpu_count()
 
-# --- Helper Functions (Preprocessing, Pins, Line Pixels - mostly unchanged) ---
+# --- Global Variables for Shared Memory (Initialized in main) ---
+# These will hold references usable by worker processes
+shared_error_buffer = None
+shared_edge_buffer = None
+shared_rows_buffer = None
+shared_cols_buffer = None
+shared_segment_indices = None # Dictionary mapping segment_key -> (start_idx, end_idx)
+shared_img_shape = None
 
+# --- Helper Functions (Preprocessing, Pins, Line Pixels - unchanged) ---
+# (Keep load_and_preprocess_image, calculate_pin_coords, get_line_pixels)
 def load_and_preprocess_image(image_path, target_size, enhance_contrast=True):
     """Loads, preprocesses image, and generates edge map."""
     try:
@@ -48,13 +62,12 @@ def load_and_preprocess_image(image_path, target_size, enhance_contrast=True):
     img_array = img_array * mask_array + 255.0 * (1.0 - mask_array)
     img_array = np.clip(img_array, 0, 255)
 
-    # --- Edge Map Calculation ---
     sx = sobel(img_array, axis=0, mode='constant', cval=255.0)
     sy = sobel(img_array, axis=1, mode='constant', cval=255.0)
     edge_map = np.hypot(sx, sy)
     if edge_map.max() > 0:
         edge_map = (edge_map / edge_map.max()) * 255.0
-    edge_map = edge_map * mask_array # Apply circle mask
+    edge_map = edge_map * mask_array
     print("  Calculated edge map.")
 
     return img_array.astype(np.float32), edge_map.astype(np.float32)
@@ -75,7 +88,7 @@ def get_line_pixels(p1, p2, img_size):
     x0, y0 = p1; x1, y1 = p2
     dist = math.ceil(math.sqrt((x1 - x0)**2 + (y1 - y0)**2))
     n_steps = int(dist)
-    if n_steps <= 0: return np.array([]), np.array([]) # Return empty if no steps
+    if n_steps <= 0: return np.array([]), np.array([])
 
     x_coords = np.linspace(x0, x1, n_steps + 1)
     y_coords = np.linspace(y0, y1, n_steps + 1)
@@ -86,130 +99,267 @@ def get_line_pixels(p1, p2, img_size):
     coords = np.vstack((rows[indices], cols[indices])).T
     unique_mask = np.concatenate(([True], np.any(coords[1:] != coords[:-1], axis=1)))
     unique_coords = coords[unique_mask]
-    if len(unique_coords) == 0: return np.array([]), np.array([]) # Handle empty unique case
+    if len(unique_coords) == 0: return np.array([]), np.array([])
     return unique_coords[:, 0], unique_coords[:, 1]
 
-def precalculate_lines(pin_coords, num_pins, img_size, min_distance):
-    """Pre-calculates pixel coordinates for valid lines."""
-    print("Pre-calculating lines...")
-    start_time = time.time(); line_cache = {}; calculation_count = 0
+
+# --- Precalculation (Modified to return flat arrays for shared memory) ---
+def precalculate_lines_for_shared_mem(pin_coords, num_pins, img_size, min_distance):
+    """Pre-calculates lines and returns data structured for shared memory."""
+    print("Pre-calculating lines for shared memory...")
+    start_time = time.time()
+    segment_pixel_indices = {} # Map (i,j) -> (start_offset, num_pixels)
+    all_rows_list = []
+    all_cols_list = []
+    current_offset = 0
+    calculation_count = 0
+
     for i in range(num_pins):
-        # Optimization: only calculate j > i
         for j in range(i + 1, num_pins):
             dist = min((j - i) % num_pins, (i - j) % num_pins)
             if dist < min_distance: continue
             p1 = pin_coords[i]; p2 = pin_coords[j]
             rows, cols = get_line_pixels(p1, p2, img_size)
-            # Only store if the line has pixels
-            if len(rows) > 0:
-                # Store only one direction (i, j) where i < j to simplify global search
-                line_cache[(i, j)] = (rows, cols)
+            num_pixels = len(rows)
+            if num_pixels > 0:
+                segment_key = (i, j)
+                all_rows_list.append(rows)
+                all_cols_list.append(cols)
+                segment_pixel_indices[segment_key] = (current_offset, num_pixels)
+                current_offset += num_pixels
                 calculation_count += 1
-        if (i + 1) % 50 == 0 or i == num_pins - 1: print(f"  Pre-calculated lines originating from pin {i+1}/{num_pins}...")
+        # Progress indicator can be added here if needed
+
+    # Concatenate all pixel coordinates into large flat arrays
+    flat_rows = np.concatenate(all_rows_list).astype(np.int32) # Use fixed size int
+    flat_cols = np.concatenate(all_cols_list).astype(np.int32)
+
     end_time = time.time()
-    print(f"Line pre-calculation finished ({calculation_count} unique lines cached) in {end_time - start_time:.2f} seconds.")
-    return line_cache
+    print(f"Line pre-calculation finished ({calculation_count} unique lines cached, {len(flat_rows)} total pixels) in {end_time - start_time:.2f} seconds.")
+    return segment_pixel_indices, flat_rows, flat_cols
 
-# --- Main Algorithm (Global Segment Selection) ---
 
-def generate_string_art_segments(image_array, edge_map, num_pins, max_segments, min_distance, line_weight, edge_weight_factor, pin_coords, line_cache):
-    """Generates the sequence of best line *segments*."""
-    print(f"Starting string art generation (Max Segments={max_segments}, weight={line_weight}, edge_factor={edge_weight_factor:.2f})...")
+# --- Initialization function for worker processes ---
+def init_worker(error_buf, edge_buf, rows_buf, cols_buf, seg_indices, img_shape):
+    """Initializer for worker processes to store shared memory refs."""
+    global shared_error_buffer, shared_edge_buffer, shared_rows_buffer, shared_cols_buffer
+    global shared_segment_indices, shared_img_shape
+    shared_error_buffer = error_buf
+    shared_edge_buffer = edge_buf
+    shared_rows_buffer = rows_buf
+    shared_cols_buffer = cols_buf
+    shared_segment_indices = seg_indices
+    shared_img_shape = img_shape
+    # print(f"Worker {os.getpid()} initialized.") # Optional debug print
+
+
+# --- Parallel Worker Function (Using Shared Memory) ---
+def worker_find_best_segment_shared(segment_keys_chunk, edge_weight_factor):
+    """
+    Worker function using shared memory.
+    Finds the best segment within a given chunk of keys.
+    """
+    # Reconstruct NumPy arrays from shared memory INSIDE the worker
+    # Error image needs acquisition of lock for read safety, although less critical if main process only writes between iterations
+    with shared_error_buffer.get_lock():
+        error_np = np.frombuffer(shared_error_buffer.get_obj(), dtype=np.float32).reshape(shared_img_shape)
+    # Edge map is read-only, lock might be less critical but safer
+    with shared_edge_buffer.get_lock():
+        edge_np = np.frombuffer(shared_edge_buffer.get_obj(), dtype=np.float32).reshape(shared_img_shape)
+    # Pixel coordinate buffers (read-only within worker)
+    rows_np = np.frombuffer(shared_rows_buffer.get_obj(), dtype=np.int32)
+    cols_np = np.frombuffer(shared_cols_buffer.get_obj(), dtype=np.int32)
+
+
+    local_best_segment = None
+    local_max_score = -np.inf
+
+    for segment_pins in segment_keys_chunk:
+        start_idx, num_pixels = shared_segment_indices[segment_pins]
+        end_idx = start_idx + num_pixels
+
+        # Get pixel coordinates for this segment from the shared flat arrays
+        rows = rows_np[start_idx:end_idx]
+        cols = cols_np[start_idx:end_idx]
+
+        # Calculate scores using the views of shared arrays
+        # Ensure coordinates are valid indices for error_np/edge_np shape
+        if rows.size > 0: # Check needed if get_line_pixels could return empty slices
+            # Clip indices just in case (shouldn't be necessary if get_line_pixels is correct)
+            # rows = np.clip(rows, 0, shared_img_shape[0] - 1)
+            # cols = np.clip(cols, 0, shared_img_shape[1] - 1)
+
+            try:
+                darkness_error = np.sum(error_np[rows, cols])
+                edge_score = np.sum(edge_np[rows, cols])
+                current_score = darkness_error + edge_weight_factor * edge_score
+
+                if current_score > local_max_score:
+                    local_max_score = current_score
+                    local_best_segment = segment_pins
+            except IndexError:
+                # This might happen if coordinates are somehow out of bounds
+                print(f"Warning: IndexError accessing shared array for segment {segment_pins}. Rows max: {np.max(rows) if rows.size>0 else 'N/A'}, Cols max: {np.max(cols) if cols.size>0 else 'N/A'}. Shape: {shared_img_shape}")
+                continue
+
+
+    return local_max_score, local_best_segment
+
+
+# --- Main Algorithm (Parallel Segment Selection using Shared Memory) ---
+def generate_string_art_segments_parallel_shared(image_array, edge_map, num_pins, max_segments, min_distance, line_weight, edge_weight_factor, pin_coords, segment_pixel_indices, flat_rows, flat_cols, num_workers):
+    """Generates segments using parallel processing and shared memory."""
+    global shared_error_buffer, shared_edge_buffer, shared_rows_buffer, shared_cols_buffer
+    global shared_segment_indices, shared_img_shape
+
+    print(f"Starting PARALLEL (Shared Memory) generation (Workers={num_workers}, Segments={max_segments})...")
     start_time = time.time()
 
     img_size = image_array.shape[0]
-    error_image = 255.0 - image_array # High value = dark area in original
+    shared_img_shape = image_array.shape # Store shape for workers
 
+    # --- Create Shared Memory Arrays ---
+    error_size_flat = image_array.size
+    shared_error_buffer = Array(ctypes.c_float, error_size_flat)
+    shared_edge_buffer = Array(ctypes.c_float, error_size_flat)
+
+    pixel_data_size = flat_rows.size
+    shared_rows_buffer = Array(ctypes.c_int, pixel_data_size)
+    shared_cols_buffer = Array(ctypes.c_int, pixel_data_size)
+
+    # --- Copy initial data into shared memory ---
+    # Error image (acquired lock for initial write)
+    error_np_shared = np.frombuffer(shared_error_buffer.get_obj(), dtype=np.float32).reshape(shared_img_shape)
+    initial_error = 255.0 - image_array
+    np.copyto(error_np_shared, initial_error)
+
+    # Edge map (acquired lock for initial write)
+    edge_np_shared = np.frombuffer(shared_edge_buffer.get_obj(), dtype=np.float32).reshape(shared_img_shape)
+    np.copyto(edge_np_shared, edge_map)
+
+    # Pixel coordinate data
+    rows_np_shared = np.frombuffer(shared_rows_buffer.get_obj(), dtype=np.int32)
+    cols_np_shared = np.frombuffer(shared_cols_buffer.get_obj(), dtype=np.int32)
+    np.copyto(rows_np_shared, flat_rows)
+    np.copyto(cols_np_shared, flat_cols)
+
+    # Segment indices dictionary doesn't need shared memory itself, just passed to initializer
+    shared_segment_indices = segment_pixel_indices
+    print("Shared memory arrays initialized.")
+
+    # --- Setup Output Image ---
     output_res = img_size * SCALE
     output_image_pil = Image.new('L', (output_res, output_res), 0) # Black bg
     draw_output = ImageDraw.Draw(output_image_pil)
+    segment_list = []
 
-    segment_list = [] # Store the chosen segments (pin_a, pin_b)
+    # --- Prepare for Pooling ---
+    all_segment_keys = list(segment_pixel_indices.keys())
+    if not all_segment_keys: return [], output_image_pil
+    num_segments_total = len(all_segment_keys)
+    chunk_size = math.ceil(num_segments_total / num_workers)
 
-    # --- Main Loop ---
-    for segment_num in range(max_segments):
-        best_segment = None
-        max_score = -np.inf
+    # --- Create Pool with Initializer ---
+    # The initializer passes the shared memory references to each worker *once* when it starts.
+    with Pool(processes=num_workers,
+              initializer=init_worker,
+              initargs=(shared_error_buffer, shared_edge_buffer,
+                        shared_rows_buffer, shared_cols_buffer,
+                        shared_segment_indices, shared_img_shape)) as pool:
+        print("Worker pool initialized.")
+        # --- Main Loop ---
+        for segment_num in range(max_segments):
+            step_start_time = time.time()
 
-        # ***** Global Search: Iterate through ALL cached line segments *****
-        # line_cache now only contains (i, j) where i < j
-        for segment_pins, (rows, cols) in line_cache.items():
-            # No need to check length rows>0 here, already done in precalc
+            # Prepare arguments for the workers for this iteration
+            # Only edge_weight_factor changes (or doesn't) - everything else is global via initializer
+            bound_worker_func = partial(worker_find_best_segment_shared,
+                                        edge_weight_factor=edge_weight_factor)
 
-            # Calculate darkness error for this line
-            darkness_error = np.sum(error_image[rows, cols])
+            key_chunks = [all_segment_keys[i:i + chunk_size] for i in range(0, num_segments_total, chunk_size)]
 
-            # Calculate edge score for this line
-            edge_score = np.sum(edge_map[rows, cols])
+            # Distribute work
+            results = pool.map(bound_worker_func, key_chunks)
 
-            # Combine scores
-            current_score = darkness_error + edge_weight_factor * edge_score
+            # Aggregate results
+            global_best_segment = None
+            global_max_score = -np.inf
+            for score, segment in results:
+                if segment is not None and score > global_max_score:
+                    global_max_score = score
+                    global_best_segment = segment
 
-            if current_score > max_score:
-                max_score = current_score
-                best_segment = segment_pins # Store the tuple (pin_a, pin_b)
+            step_find_time = time.time()
 
-        # --- Process the Globally Best Segment Found ---
-        if best_segment is None or max_score <= 0: # Stop if no improvement possible
-             if best_segment is None:
-                 print(f"Warning: No suitable segment found at step {segment_num + 1}. Stopping.")
-             else:
-                 print(f"Stopping at step {segment_num + 1}: Max score non-positive ({max_score:.2f}). Image likely saturated.")
-             break
+            # --- Process Best Segment ---
+            if global_best_segment is None or global_max_score <= 0:
+                 if global_best_segment is None: print(f"Warning: No suitable segment found at step {segment_num + 1}.")
+                 else: print(f"Stopping at step {segment_num + 1}: Max score non-positive ({global_max_score:.2f}).")
+                 break
 
-        segment_list.append(best_segment)
-        pin_a, pin_b = best_segment
+            segment_list.append(global_best_segment)
+            pin_a, pin_b = global_best_segment
 
-        # Get line pixels for the chosen segment
-        # We know (pin_a, pin_b) is in the cache because we just iterated through it
-        rows, cols = line_cache[(pin_a, pin_b)]
+            # Retrieve pixel coordinates (from shared memory via indices dict)
+            start_idx, num_pixels = shared_segment_indices[(pin_a, pin_b)]
+            end_idx = start_idx + num_pixels
+            # Lock the coordinate buffers while reading
+            with shared_rows_buffer.get_lock(), shared_cols_buffer.get_lock():
+                rows = np.copy(rows_np_shared[start_idx:end_idx]) # Copy needed coords
+                cols = np.copy(cols_np_shared[start_idx:end_idx])
 
-        # Subtract darkness (error reduction)
-        error_image[rows, cols] -= line_weight
-        np.clip(error_image, 0, None, out=error_image)
+            # --- Update error image IN SHARED MEMORY (Sequential Part - needs lock) ---
+            with shared_error_buffer.get_lock():
+                # Get a view OF THE SHARED BUFFER again to update it
+                error_np_shared_view = np.frombuffer(shared_error_buffer.get_obj(), dtype=np.float32).reshape(shared_img_shape)
+                if rows.size > 0: # Ensure there are pixels to update
+                    error_np_shared_view[rows, cols] -= line_weight
+                    np.clip(error_np_shared_view[rows, cols], 0, None, out=error_np_shared_view[rows, cols]) # Clip in place
 
-        # Draw line on the output image (white)
-        p1_scaled = (pin_coords[pin_a][0] * SCALE, pin_coords[pin_a][1] * SCALE)
-        p2_scaled = (pin_coords[pin_b][0] * SCALE, pin_coords[pin_b][1] * SCALE)
-        draw_output.line([p1_scaled, p2_scaled], fill=255, width=1)
 
-        # Progress indicator (might be slower now)
-        if (segment_num + 1) % 50 == 0: # Report less frequently?
-            print(f"  Generated segment {segment_num + 1}/{max_segments} (Score: {max_score:.0f})")
-            # Optional: Save intermediate preview
-            # output_image_pil.save(f"segment_preview_{segment_num+1}.png")
+            # Draw line (Sequential Part)
+            p1_scaled = (pin_coords[pin_a][0] * SCALE, pin_coords[pin_a][1] * SCALE)
+            p2_scaled = (pin_coords[pin_b][0] * SCALE, pin_coords[pin_b][1] * SCALE)
+            draw_output.line([p1_scaled, p2_scaled], fill=255, width=1)
 
-    end_time = time.time()
-    # Note: Computation time per step will be higher due to the global search
-    print(f"Segment generation finished ({len(segment_list)} segments generated) in {end_time - start_time:.2f} seconds.")
+            step_end_time = time.time()
+
+            if (segment_num + 1) % 10 == 0 or segment_num < 10: # Report more frequently initially
+                print(f"  Segment {segment_num + 1}/{max_segments} | Best Score: {global_max_score:.0f} | Time: {(step_end_time - step_start_time)*1000:.1f} ms (Find: {(step_find_time - step_start_time)*1000:.1f} ms)")
+
+    total_end_time = time.time()
+    print(f"Segment generation finished ({len(segment_list)} segments generated) in {total_end_time - start_time:.2f} seconds.")
     return segment_list, output_image_pil
+
 
 # --- Main Execution ---
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Generate String Art using Globally Optimal Line Segments.")
+    multiprocessing.freeze_support() # For Windows packaging
+
+    parser = argparse.ArgumentParser(description="Generate String Art - Optimal Segments (Parallel Shared Memory).")
+    # Arguments remain mostly the same
     parser.add_argument("input_image", help="Path to the input image file.")
-    # Changed output file names/descriptions
-    parser.add_argument("-o", "--output_segments", default="string_art_segments.txt", help="Output file for line segments (pin_a,pin_b per line)")
-    parser.add_argument("-p", "--output_png", default="string_art_preview_segments.png", help="Output file for the preview image")
+    parser.add_argument("-o", "--output_segments", default="string_art_segments.txt", help="Output file for line segments")
+    parser.add_argument("-p", "--output_png", default="string_art_preview_segments_parallel_sm.png", help="Output file for the preview image") # New default name
     parser.add_argument("--pins", type=int, default=DEFAULT_N_PINS, help=f"Number of pins (default: {DEFAULT_N_PINS})")
-    # Renamed --lines to --segments
-    parser.add_argument("--segments", "--lines", type=int, default=DEFAULT_MAX_LINES, dest='max_segments', help=f"Maximum number of line segments to generate (default: {DEFAULT_MAX_LINES})")
+    parser.add_argument("--segments", "--lines", type=int, default=DEFAULT_MAX_LINES, dest='max_segments', help=f"Max segments (default: {DEFAULT_MAX_LINES})")
     parser.add_argument("--weight", type=float, default=DEFAULT_LINE_WEIGHT, help=f"Line darkness weight (default: {DEFAULT_LINE_WEIGHT})")
     parser.add_argument("--size", type=int, default=IMG_SIZE, help=f"Internal processing size (default: {IMG_SIZE})")
     parser.add_argument("--mindist", type=int, default=MIN_DISTANCE, help=f"Minimum pin distance (default: {MIN_DISTANCE})")
-    # Removed --minloop argument as it's not used
     parser.add_argument("--previewpins", action='store_true', help="Draw pin markers on preview.")
     parser.add_argument("--ew", "--edge_weight", type=float, default=DEFAULT_EDGE_WEIGHT, dest='edge_weight', help=f"Weight factor for edges (default: {DEFAULT_EDGE_WEIGHT:.2f})")
     parser.add_argument("--no_contrast", action='store_false', dest='enhance_contrast', help="Disable automatic contrast enhancement.")
+    parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS, help=f"Number of worker processes (default: use all cores)")
 
     args = parser.parse_args()
 
     # Validation
-    if args.pins < 3 or args.max_segments < 1 or args.weight <= 0 or args.size < 50 or args.mindist < 1 or args.edge_weight < 0:
+    if args.pins < 3 or args.max_segments < 1 or args.weight <= 0 or args.size < 50 or args.mindist < 1 or args.edge_weight < 0 or args.workers < 1:
         print("Error: Invalid parameter values."); exit(1)
     if args.mindist >= args.pins // 2: print(f"Warning: Minimum distance ({args.mindist}) may be large.")
+    actual_workers = min(args.workers, os.cpu_count()); print(f"Using {actual_workers} worker processes.")
 
-    # 1. Load, preprocess image, AND get edge map
+    # 1. Load image and edge map
     print(f"Loading and preprocessing '{args.input_image}'...")
     processed_image_array, edge_map_array = load_and_preprocess_image(
         args.input_image, args.size, enhance_contrast=args.enhance_contrast)
@@ -218,42 +368,42 @@ if __name__ == "__main__":
     # 2. Calculate Pin Coordinates
     pin_coordinates = calculate_pin_coords(args.pins, args.size)
 
-    # 3. Pre-calculate Lines (Cache stores only unique pairs i < j)
-    line_pixel_cache = precalculate_lines(pin_coordinates, args.pins, args.size, args.mindist)
-    if not line_pixel_cache: print("Error: No valid lines pre-calculated."); exit(1)
-    print(f"Number of unique line segments in cache: {len(line_pixel_cache)}")
+    # 3. Pre-calculate Lines for Shared Memory
+    segment_pixel_indices, flat_rows, flat_cols = precalculate_lines_for_shared_mem(
+        pin_coordinates, args.pins, args.size, args.mindist)
+    if not segment_pixel_indices: print("Error: No valid lines pre-calculated."); exit(1)
 
-
-    # 4. Generate String Art using Global Segment Selection
-    segment_list, preview_image = generate_string_art_segments(
+    # 4. Generate String Art using Shared Memory Parallelism
+    segment_list, preview_image = generate_string_art_segments_parallel_shared(
         processed_image_array,
         edge_map_array,
         args.pins,
-        args.max_segments, # Use the renamed arg
-        args.mindist,      # Still needed for precalc
+        args.max_segments,
+        args.mindist,
         args.weight,
         args.edge_weight,
         pin_coordinates,
-        line_pixel_cache
+        segment_pixel_indices, # Pass dict mapping segment to index/len
+        flat_rows,             # Pass flat array of row coords
+        flat_cols,             # Pass flat array of col coords
+        actual_workers
     )
 
-    # 5. Save the Segment List
+    # 5. Save Segment List
     try:
-        # Save as "pin_a,pin_b" per line
         with open(args.output_segments, 'w') as f:
-            for seg in segment_list:
-                f.write(f"{seg[0]},{seg[1]}\n")
+            for seg in segment_list: f.write(f"{seg[0]},{seg[1]}\n")
         print(f"Line segments saved to '{args.output_segments}'")
     except IOError as e: print(f"Error saving segments file: {e}")
 
-    # 6. Save the Preview Image
+    # 6. Save Preview Image
     try:
         if args.previewpins:
             draw_preview = ImageDraw.Draw(preview_image)
             pin_marker_radius = max(1, SCALE * 1)
             for x, y in pin_coordinates:
                 scaled_x = x * SCALE; scaled_y = y * SCALE
-                draw_preview.ellipse((int(scaled_x-pin_marker_radius), int(scaled_y-pin_marker_radius), int(scaled_x+pin_marker_radius), int(scaled_y+pin_marker_radius)), fill=255) # White pins
+                draw_preview.ellipse((int(scaled_x-pin_marker_radius), int(scaled_y-pin_marker_radius), int(scaled_x+pin_marker_radius), int(scaled_y+pin_marker_radius)), fill=255)
         preview_image.save(args.output_png)
         print(f"String art preview saved to '{args.output_png}'")
     except IOError as e: print(f"Error saving preview image: {e}")
