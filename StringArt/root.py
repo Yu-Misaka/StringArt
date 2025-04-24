@@ -17,7 +17,7 @@ DEFAULT_N_PINS = 288
 DEFAULT_MAX_LINES = 1500 # segments
 MIN_DISTANCE = 15
 DEFAULT_LINE_WEIGHT = 35 # May need slight adjustment with AA weights
-SCALE = 15
+SCALE = 2
 DEFAULT_EDGE_WEIGHT = 0.8
 DEFAULT_WORKERS = os.cpu_count()
 # Constant for Anti-aliasing distance threshold (pixels)
