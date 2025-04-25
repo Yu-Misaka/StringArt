@@ -19,7 +19,7 @@ def calculate_pin_coords(num_pins, size):
 
 r = 500
 pins = calculate_pin_coords(400, r)
-scale = 6.5
+scale = 7
 scale_pins = [[((x[0] / r) - 0.5) * scale, (0.5 - (x[1] / r)) * scale, 0] 
     for x in pins]
 
@@ -45,6 +45,12 @@ class Test(Scene):
         self.play(Create(square))  # animate the creation of the square
         self.play(Transform(square, circle))  # interpolate the square into the circle
         self.play(FadeOut(square))  # fade out animation
+
+class Static(Scene):
+    def construct(self):
+        self.camera.background_color = WHITE
+        dot_pin = [Dot(x).scale(0.05) for x in scale_pins]
+        self.add(*[Line(dot_pin[x[0]], dot_pin[x[1]]).set_stroke(DARK_BROWN, 0.1, opacity=0.2) for x in result])
 
 class SA(Scene):
     def construct(self):
