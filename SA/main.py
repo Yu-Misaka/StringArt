@@ -23,7 +23,7 @@ scale = 6.5
 scale_pins = [[((x[0] / r) - 0.5) * scale, (0.5 - (x[1] / r)) * scale, 0] 
     for x in pins]
 
-with open("P:\\ProjectRepo\\2025Xmas\\StringArt\\SA\\out1.txt", "r") as f:
+with open("out1.txt", "r") as f:
     result = f.readlines()
     for ind in range(len(result)):
         result[ind] = tuple(map(int, result[ind].split(",")))
