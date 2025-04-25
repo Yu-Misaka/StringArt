@@ -33,6 +33,19 @@ begin_with = [
     [list(key) for key, value in begin_with_dict.items() if value == x] 
         for x in range(len(pins))]
 
+class Test(Scene):
+    def construct(self):
+        circle = Circle()  # create a circle
+        circle.set_fill(PINK, opacity=0.5)  # set color and transparency
+
+        square = Square()  # create a square
+        square.flip(RIGHT)  # flip horizontally
+        square.rotate(-3 * TAU / 8)  # rotate a certain amount
+
+        self.play(Create(square))  # animate the creation of the square
+        self.play(Transform(square, circle))  # interpolate the square into the circle
+        self.play(FadeOut(square))  # fade out animation
+
 class SA(Scene):
     def construct(self):
         self.camera.background_color = WHITE
@@ -42,7 +55,6 @@ class SA(Scene):
             vg = VGroup()
             vg.add(*[Line(dot_pin[x[0]], dot_pin[x[1]]).set_stroke(DARK_BLUE, 0.1, opacity=0.2) for x in line])
             self.play(Create(vg))
-            self.wait(0.3)
 
 
 '''
