@@ -14,8 +14,8 @@ DEFAULT_N_PINS = 288
 DEFAULT_MAX_LINES = 4000
 MIN_DISTANCE = 20
 MIN_LOOP = 20
-DEFAULT_LINE_WEIGHT = 10
-SCALE = 15
+DEFAULT_LINE_WEIGHT = 30
+SCALE = 5
 
 
 # --- Helper Functions ---
@@ -337,7 +337,8 @@ if __name__ == "__main__":
     # 5. Save the Sequence
     try:
         with open(args.output_seq, 'w') as f:
-            f.write(','.join(map(str, sequence)))
+            for i in range(len(sequence) - 1) :
+                f.write(str(sequence[i]) + "," + str(sequence[i + 1]) + "\n")
         print(f"Pin sequence saved to '{args.output_seq}'")
     except IOError as e:
         print(f"Error saving sequence file: {e}")
