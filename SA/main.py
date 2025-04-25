@@ -59,7 +59,7 @@ class SA(Scene):
         self.add(*dot_pin)
         for line in begin_with:
             vg = VGroup()
-            vg.add(*[Line(dot_pin[x[0]], dot_pin[x[1]]).set_stroke(DARK_BLUE, 0.1, opacity=0.2) for x in line])
+            vg.add(*[Line(dot_pin[x[0]], dot_pin[x[1]]).set_stroke(DARK_BROWN, 0.1, opacity=0.2) for x in line])
             self.play(Create(vg))
 
 
