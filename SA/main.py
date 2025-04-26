@@ -31,10 +31,12 @@ begin_with = [
 
 dot_pin = [Dot(x).scale(0.01) for x in scale_pins]
 
+col = BLACK
+
 class Static(Scene):
     def construct(self):
         self.camera.background_color = WHITE
-        self.add(*[Line(dot_pin[x[0]], dot_pin[x[1]]).set_stroke(DARK_GREY, 0.1, opacity=0.5) for x in result])
+        self.add(*[Line(dot_pin[x[0]], dot_pin[x[1]]).set_stroke(col, 0.1, opacity=0.5) for x in result])
 
 class SA(Scene):
     def construct(self):
@@ -42,14 +44,14 @@ class SA(Scene):
         # self.add(*dot_pin)
         for line in begin_with:
             vg = VGroup()
-            vg.add(*[Line(dot_pin[x[0]], dot_pin[x[1]]).set_stroke(DARK_GREY, 0.1, opacity=0.5) for x in line])
+            vg.add(*[Line(dot_pin[x[0]], dot_pin[x[1]]).set_stroke(col, 0.1, opacity=0.5) for x in line])
             self.play(Create(vg))
 
 class SA_first(Scene):
     def construct(self):
         self.camera.background_color = WHITE
         vg = VGroup()
-        vg.add(*[Line(dot_pin[x[0]], dot_pin[x[1]]).set_stroke(DARK_GREY, 0.1, opacity=0.5) for x in begin_with[0]])
+        vg.add(*[Line(dot_pin[x[0]], dot_pin[x[1]]).set_stroke(col, 0.1, opacity=0.5) for x in begin_with[0]])
         self.play(Create(vg), run_time = 3)
 
 '''
