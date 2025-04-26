@@ -1,19 +1,15 @@
 from manim import *
 import math
-import os
 
 def calculate_pin_coords(num_pins, size):
     """Calculates the (x, y) coordinates of pins on the circumference."""
     center = size / 2.0
-    radius = size / 2.0 - 1 # Small offset to keep pins inside bounds
+    radius = size / 2.0
     coords = []
     for i in range(num_pins):
         angle = 2 * math.pi * i / num_pins
-        # Calculate coordinates and ensure they are within image bounds
-        x = int(round(center + radius * math.cos(angle)))
-        y = int(round(center + radius * math.sin(angle)))
-        x = max(0, min(size - 1, x)) # Clamp coordinates to image dimensions
-        y = max(0, min(size - 1, y))
+        x = center + radius * math.cos(angle)
+        y = center + radius * math.sin(angle)
         coords.append((x, y))
     return coords
 
@@ -33,35 +29,28 @@ begin_with = [
     [list(key) for key, value in begin_with_dict.items() if value == x] 
         for x in range(len(pins))]
 
-class Test(Scene):
-    def construct(self):
-        circle = Circle()  # create a circle
-        circle.set_fill(PINK, opacity=0.5)  # set color and transparency
-
-        square = Square()  # create a square
-        square.flip(RIGHT)  # flip horizontally
-        square.rotate(-3 * TAU / 8)  # rotate a certain amount
-
-        self.play(Create(square))  # animate the creation of the square
-        self.play(Transform(square, circle))  # interpolate the square into the circle
-        self.play(FadeOut(square))  # fade out animation
+dot_pin = [Dot(x).scale(0.01) for x in scale_pins]
 
 class Static(Scene):
     def construct(self):
         self.camera.background_color = WHITE
-        dot_pin = [Dot(x).scale(0.05) for x in scale_pins]
-        self.add(*[Line(dot_pin[x[0]], dot_pin[x[1]]).set_stroke(DARK_BROWN, 0.1, opacity=0.2) for x in result])
+        self.add(*[Line(dot_pin[x[0]], dot_pin[x[1]]).set_stroke(DARK_GREY, 0.1, opacity=0.5) for x in result])
 
 class SA(Scene):
     def construct(self):
         self.camera.background_color = WHITE
-        dot_pin = [Dot(x).scale(0.05) for x in scale_pins]
-        self.add(*dot_pin)
+        # self.add(*dot_pin)
         for line in begin_with:
             vg = VGroup()
-            vg.add(*[Line(dot_pin[x[0]], dot_pin[x[1]]).set_stroke(DARK_BROWN, 0.1, opacity=0.2) for x in line])
+            vg.add(*[Line(dot_pin[x[0]], dot_pin[x[1]]).set_stroke(DARK_GREY, 0.1, opacity=0.5) for x in line])
             self.play(Create(vg))
 
+class SA_first(Scene):
+    def construct(self):
+        self.camera.background_color = WHITE
+        vg = VGroup()
+        vg.add(*[Line(dot_pin[x[0]], dot_pin[x[1]]).set_stroke(DARK_GREY, 0.1, opacity=0.5) for x in begin_with[0]])
+        self.play(Create(vg), run_time = 3)
 
 '''
 class DefaultTemplate(Scene):
